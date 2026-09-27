@@ -1,0 +1,54 @@
+name: Image distribution
+on:
+  push:
+    branches: [main]
+    paths: ['atlas/**', 'image/**', 'others/**', 'texture_version.txt']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: image-distribution
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.repository == 'pinisok/gkms_web_texture_data' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Validate and package the selected image revision
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/repository_assets.py package . "$RUNNER_TEMP/image-release" > "$RUNNER_TEMP/image-release.json"
+          python3 -c 'import json,os; v=json.load(open(os.environ["RUNNER_TEMP"]+"/image-release.json"))["version"]; open(os.environ["GITHUB_OUTPUT"],"a").write("version="+v+"\n")'
+      - name: Publish the verified ZIP or verify the existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.pack.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            mkdir "$RUNNER_TEMP/existing-release"
+            gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --pattern texture2d.zip --dir "$RUNNER_TEMP/existing-release"
+            python3 .github/scripts/repository_assets.py verify . "$RUNNER_TEMP/existing-release/texture2d.zip"
+          else
+            gh release create "$VERSION" "$RUNNER_TEMP/image-release/texture2d.zip" "$RUNNER_TEMP/image-release/SHA256SUMS" \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Images $VERSION" \
+              --notes "Verified image distribution from commit $GITHUB_SHA."
+          fi
+      - name: Keep the newest three releases only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft == false) | [.created_at, .tag_name] | @tsv' > "$RUNNER_TEMP/releases.tsv"
+          sort -r "$RUNNER_TEMP/releases.tsv" | tail -n +4 | cut -f2 > "$RUNNER_TEMP/old-releases.txt"
+          while read -r tag; do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done < "$RUNNER_TEMP/old-releases.txt"
